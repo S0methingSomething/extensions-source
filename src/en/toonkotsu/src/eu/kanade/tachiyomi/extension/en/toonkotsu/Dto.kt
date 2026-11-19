@@ -9,6 +9,8 @@ import kotlinx.serialization.Transient
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.time.Clock
+import kotlin.time.Instant
 
 @Serializable
 class BrowseDto(
@@ -60,6 +62,16 @@ class SeriesDto(
     private val editions: List<EditionDto> = emptyList(),
 ) {
     val isEnglishOriginal get() = originalLanguage == "en"
+
+    // Values exposed to user scoring rules in the extension's settings
+    fun scoringContext(showSpoilerTags: Boolean): Map<String, Any?> = mapOf<String, Any?>(
+        "title" to title,
+        "genres" to (if (showSpoilerTags) tags else tags - spoilerTags.toSet()),
+        "type" to type,
+        "year" to year,
+        "status" to status,
+        "originalLanguage" to originalLanguage,
+    )
 
     fun toSManga(baseUrl: String, showSpoilerTags: Boolean) = SManga.create().apply {
         url = "/title/$hid"
@@ -219,6 +231,24 @@ class ChapterDto(
     val numericVolume get() = vol?.trim()?.toDoubleOrNull()
 
     val chapterKey get() = n ?: parentId ?: id
+
+    // Values exposed to user scoring rules in the extension's settings
+    fun scoringContext(likes: Int, sourceRank: Int, groupRank: Int): Map<String, Any?> = mapOf<String, Any?>(
+        "group" to group?.name,
+        "slug" to group?.slug,
+        "source" to src,
+        "partial" to partial,
+        "isAlt" to (parentId != null),
+        "size" to mb,
+        "pages" to pages,
+        "width" to w,
+        "number" to n,
+        "volume" to numericVolume,
+        "ageDays" to at?.let { (Clock.System.now() - Instant.fromEpochMilliseconds(it)).inWholeDays.toDouble() },
+        "likes" to likes,
+        "sourceRank" to sourceRank,
+        "groupRank" to groupRank,
+    )
 
     fun row(byVolume: Boolean, byGroup: Boolean = true) = listOf(
         (numericVolume ?: vol?.trim()?.lowercase().orEmpty()).takeIf { byVolume },

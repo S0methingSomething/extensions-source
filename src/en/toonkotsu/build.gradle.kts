@@ -4,9 +4,13 @@ plugins {
     alias(kei.plugins.extension)
 }
 
+dependencies {
+    implementation(project(":lib:selexpr"))
+}
+
 keiyoushi {
     name = "Toonkotsu"
-    versionCode = 6
+    versionCode = 7
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.extension.en.toonkotsu
 
+import android.text.InputType
 import android.util.Base64
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
@@ -15,6 +17,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.lib.selexpr.SelExpr
 import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
@@ -177,8 +180,9 @@ abstract class Toonkotsu :
         if (englishCovers && !data.series.isEnglishOriginal) {
             details.thumbnail_url = covers?.await()?.earliestEnglishUrl(baseUrl) ?: details.thumbnail_url.takeIf { fetchDetails }
         }
-        // One per chapter ranks by likes, a request of its own
-        val needsLikes = preferences.getString(PREF_CHAPTER_LIST, ONE_PER_GROUP) == ONE_PER_CHAPTER
+        // One per chapter ranks by likes, and so may scoring rules; either needs the extra request
+        val needsLikes = preferences.getString(PREF_CHAPTER_LIST, ONE_PER_GROUP) == ONE_PER_CHAPTER ||
+            chapterRules()?.variables?.contains("likes") == true
         SMangaUpdate(details, if (fetchChapters || !needsLikes) chapterList(data, manga.url) else chapters)
     }
 
@@ -198,11 +202,45 @@ abstract class Toonkotsu :
         val uploads = allUploads.filterNot { upload -> hiddenGroups.any { upload.isFromSource(it) || upload.isFromGroup(it) } }
         val preferredSources = commaList(PREF_PREFERRED_SOURCES, "")
         val sourceRank = { upload: ChapterDto -> preferredSources.rankOf(upload::isFromSource) }
+        // SEL rules, one per line; empty leaves the built-in ranking untouched
+        val rules = chapterRules()
+        val mode = preferences.getString(PREF_CHAPTER_LIST, ONE_PER_GROUP)
+        val preferredGroupsList = commaList(PREF_PREFERRED_GROUPS, DEFAULT_PREFERRED_GROUPS)
+        // The site's per-chapter likes, its only user rank for uploads; one fetch serves
+        // both the built-in ranking and any rule that reads them
+        val likes = if (mode == ONE_PER_CHAPTER || (rules != null && "likes" in rules.variables)) {
+            fetchLikes(data.series.id)
+        } else {
+            null
+        }
+        val score = rules?.let { rules ->
+            { upload: ChapterDto ->
+                rules.score(
+                    upload.bindings(
+                        data.series,
+                        likes,
+                        preferredSources,
+                        preferredGroupsList,
+                    ),
+                )
+            }
+        }
         // One upload per row, in the site's order; preferred sources sit where the site's own preferred source does
-        val picks = uploads.sortedWith(compareBy({ it.partial }, sourceRank, { it.parentId != null }))
-            .distinctBy { it.row(byVolume) }
-            .toSet()
-        val chapterList = when (preferences.getString(PREF_CHAPTER_LIST, ONE_PER_GROUP)) {
+        val picks = if (score != null) {
+            uploads.sortedWith(
+                compareBy<ChapterDto> { it.partial }
+                    .thenByDescending(score)
+                    .thenBy(sourceRank)
+                    .thenBy { it.parentId != null },
+            )
+                .distinctBy { it.row(byVolume) }
+                .toSet()
+        } else {
+            uploads.sortedWith(compareBy({ it.partial }, sourceRank, { it.parentId != null }))
+                .distinctBy { it.row(byVolume) }
+                .toSet()
+        }
+        val chapterList = when (mode) {
             ONE_PER_GROUP -> {
                 val complete = picks.filterNot { it.partial }.mapTo(HashSet()) { it.row(byVolume, byGroup = false) }
                 // The site hides a partial-only row when another group has the full chapter
@@ -210,15 +248,22 @@ abstract class Toonkotsu :
             }
             ONE_PER_CHAPTER -> {
                 val preferredGroups = commaList(PREF_PREFERRED_GROUPS, DEFAULT_PREFERRED_GROUPS)
-                // The site's per-chapter likes, its only user rank for uploads
-                val likes = fetchLikes(data.series.id)
                 uploads.filter { it in picks }
                     .groupBy { it.row(byVolume, byGroup = false) }
                     .map { (_, same) ->
-                        same.sortedWith(
-                            compareBy<ChapterDto>({ it.partial }, { preferredGroups.rankOf(it::isFromGroup) })
-                                .thenByDescending { likes[it.id.toString()] ?: 0 },
-                        ).first()
+                        if (score != null) {
+                            same.maxWith(
+                                compareBy<ChapterDto> { score(it) }
+                                    .thenBy { it.partial }
+                                    .thenBy { preferredGroups.rankOf(it::isFromGroup) }
+                                    .thenByDescending { likes?.get(it.id.toString()) ?: 0 },
+                            )
+                        } else {
+                            same.sortedWith(
+                                compareBy<ChapterDto>({ it.partial }, { preferredGroups.rankOf(it::isFromGroup) })
+                                    .thenByDescending { likes?.get(it.id.toString()) ?: 0 },
+                            ).first()
+                        }
                     }
             }
             else -> {
@@ -234,6 +279,26 @@ abstract class Toonkotsu :
         }
         val nameFormat = preferences.getString(PREF_CHAPTER_NAMES, NAME_LABEL)!!
         return chapterList.map { it.toSChapter(mangaUrl, withSourceCode = it !in picks, nameFormat) }
+    }
+
+    private fun chapterRules(): SelExpr.Rules? = preferences.getString(PREF_CHAPTER_RULES, null)?.takeIf { it.isNotBlank() }?.let {
+        SelExpr.compile(it, RULE_VARIABLES)
+    }
+
+    private fun ChapterDto.bindings(
+        series: SeriesDto,
+        likes: Map<String, Int>?,
+        preferredSources: List<String>,
+        preferredGroups: List<String>,
+    ): Map<String, Any?> = buildMap {
+        scoringContext(
+            likes = likes?.get(id.toString()) ?: 0,
+            sourceRank = preferredSources.rankOf(this@bindings::isFromSource),
+            groupRank = preferredGroups.rankOf(this@bindings::isFromGroup),
+        ).forEach { (key, value) -> put(key, value) }
+        series.scoringContext(showSpoilerTags).forEach { (key, value) -> put(key, value) }
+        put("preferredSources", preferredSources)
+        put("preferredGroups", preferredGroups)
     }
 
     private suspend fun fetchLikes(seriesId: Long): Map<String, Int> {
@@ -396,6 +461,31 @@ abstract class Toonkotsu :
             setDefaultValue("")
         }.let(screen::addPreference)
 
+        EditTextPreference(screen.context).apply {
+            key = PREF_CHAPTER_RULES
+            title = "Chapter scoring rules"
+            summary = "One rule per line, each 'score: expression' or just an expression. " +
+                "Uploads of a chapter are ranked by the summed scores; ties keep the built-in order. " +
+                "Available: group, slug, source, partial, isAlt, size, pages, width, number, volume, ageDays, likes, " +
+                "sourceRank, groupRank, preferredSources, preferredGroups, genres, title, year, type, originalLanguage, status"
+            dialogTitle = "Chapter scoring rules"
+            setDefaultValue("")
+            setOnBindEditTextListener { editText ->
+                editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                editText.setLines(8)
+            }
+            setOnPreferenceChangeListener { _, newValue ->
+                val source = newValue as? String ?: ""
+                try {
+                    if (source.isNotBlank()) SelExpr.compile(source, RULE_VARIABLES)
+                    true
+                } catch (e: Exception) {
+                    Toast.makeText(screen.context, e.message, Toast.LENGTH_LONG).show()
+                    false
+                }
+            }
+        }.let(screen::addPreference)
+
         ListPreference(screen.context).apply {
             key = PREF_CHAPTER_NAMES
             title = "Chapter names"
@@ -436,11 +526,17 @@ abstract class Toonkotsu :
         private const val PREF_PREFERRED_GROUPS = "pref_preferred_groups"
         private const val PREF_HIDDEN_GROUPS = "pref_hidden_groups"
         private const val PREF_ENGLISH_COVERS = "pref_english_covers"
+        private const val PREF_CHAPTER_RULES = "pref_chapter_rules"
         private const val DEFAULT_PREFERRED_GROUPS = "Official"
         private const val ALL_UPLOADS = "all"
         private const val ONE_PER_GROUP = "group"
         private const val ONE_PER_CHAPTER = "chapter"
         private const val TURNSTILE_SITE_KEY = "0x4AAAAAAFQpQeG5qpmLQtf9"
         private val HID_REGEX = Regex("""^[a-z][0-9a-z]{4}(?=-|$)""")
+        private val RULE_VARIABLES = setOf(
+            "group", "slug", "source", "partial", "isAlt", "size", "pages", "width", "number", "volume",
+            "ageDays", "likes", "sourceRank", "groupRank", "preferredSources", "preferredGroups",
+            "genres", "title", "year", "type", "originalLanguage", "status",
+        )
     }
 }

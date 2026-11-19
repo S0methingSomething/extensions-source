@@ -1,7 +1,9 @@
 package eu.kanade.tachiyomi.extension.all.mangadotnet
 
 import android.content.SharedPreferences
+import android.text.InputType
 import android.util.Log
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
